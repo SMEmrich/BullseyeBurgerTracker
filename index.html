@@ -662,6 +662,15 @@ var WORKER_SRC =
 // ---------- banners ----------
 function banners(){
   var h='';
+  // Opening the file straight off disk looks identical to a CORS failure but isn't one:
+  // browsers refuse every cross-origin call from a file:// page no matter what headers come back.
+  if(location.protocol==='file:'){
+    h+='<div class="banner bad"><h3>This page is running off your hard drive</h3>'+
+       '<p>The address bar starts with <b>file://</b>. Browsers block every outside call from a page '+
+       'opened that way — no header, proxy or setting changes it, so nothing here can load. '+
+       'Put the file on GitHub Pages and open it at its https address, or, to test right now, run '+
+       '<b>python3 -m http.server</b> in the folder and open <b>http://localhost:8000</b>.</p></div>';
+  }
   if(S.err){
     var blocked = S.netfail || /Failed to fetch|NetworkError|load failed|CORS/i.test(S.err);
     h+='<div class="banner bad"><h3>'+(blocked?'Your browser is blocking the NHL':'Something went wrong')+'</h3>'+
