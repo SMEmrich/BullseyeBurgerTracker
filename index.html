@@ -215,7 +215,7 @@ var DEFAULT_ROSTER = {"Tony":[{"name":"Connor McDavid","team":"EDM","pos":"C"},{
 var API   = 'https://api-web.nhle.com';
 var STATS = 'https://api.nhle.com';
 
-var BUILD = 'v4 · 29 Sep';
+var BUILD = 'v5 · 29 Sep';
 // Baked in so every device and every GM works on first open. Settings live in
 // localStorage, which is per-browser — without a default here, each phone would
 // arrive with an empty proxy field and fail. Clear the field in Setup to go direct.
@@ -263,11 +263,22 @@ function url(u){
   var p = S.proxy.replace(/\/+$/,'');
   return p + (p.indexOf('?')>-1?'&':'?') + 'u=' + encodeURIComponent(u);
 }
-function getJSON(u){
-  return fetch(url(u),{cache:'no-store'}).then(function(r){
-    if(!r.ok) throw new Error('HTTP '+r.status+' on '+u);
-    return r.json();
-  });
+/* Retries transient refusals. A burst of requests from one address can get
+   throttled (429) or dropped, and a single miss used to sink the whole load. */
+function getJSON(u, tries){
+  tries = tries || 3;
+  function attempt(left){
+    return fetch(url(u),{cache:'no-store'}).then(function(r){
+      if(r.status===429 || r.status===408 || r.status>=500) throw new Error('HTTP '+r.status);
+      if(!r.ok) throw new Error('HTTP '+r.status+' on '+u);
+      return r.json();
+    }).catch(function(e){
+      if(left<=1) throw e;
+      var wait = 500 * Math.pow(3, tries-left);   // 500ms, then 1.5s
+      return new Promise(function(res){ setTimeout(res, wait); }).then(function(){ return attempt(left-1); });
+    });
+  }
+  return attempt(tries);
 }
 function throttle(items, n, fn){
   var i=0, out=[], active=0;
@@ -287,48 +298,82 @@ function throttle(items, n, fn){
   });
 }
 
-// ---------- name -> playerId index ----------
-function buildIndex(){
-  var byFull={}, bySur={}, all=[], lastErr=null;
-  S.prog={done:0,total:TEAMS.length};
-  render();
-  return throttle(TEAMS, 6, function(t){
-    return getJSON(API+'/v1/roster/'+t+'/current').catch(function(e){ lastErr=e; throw e; }).then(function(j){
-      ['forwards','defensemen','goalies'].forEach(function(k){
-        (j[k]||[]).forEach(function(p){
-          var fn=(p.firstName&&p.firstName.default)||'', ln=(p.lastName&&p.lastName.default)||'';
-          if(!ln) return;
-          var rec={id:p.id, first:fn, last:ln, full:(fn+' '+ln).trim(), team:t, pos:p.positionCode};
-          all.push(rec);
-          (byFull[norm(rec.full)] = byFull[norm(rec.full)]||[]).push(rec);
-          (bySur[norm(ln)]        = bySur[norm(ln)]||[]).push(rec);
-        });
-      });
-    }).then(function(){ S.prog.done++; render(); });
-  }).then(function(){
-    S.prog=null;
-    if(!all.length){
-      S.netfail = true;
-      throw new Error(lastErr ? String(lastErr.message||lastErr) : 'No rosters came back.');
-    }
-    S.netfail = false;
-    var idx={byFull:byFull, bySur:bySur, all:all, at:Date.now()};
-    S.index=idx;
-    try{ store.set('index',{at:idx.at, all:all}); }catch(e){}
-    return idx;
+/* ---------- name -> playerId index ----------
+   Built one team at a time and merged, never all-or-nothing. Fetching all 32
+   rosters at once is a burst the API can refuse; instead only the teams playing
+   today are fetched up front, plus a few spares each refresh, so the index fills
+   in over a couple of nights. A team we don't have yet costs nothing: its players
+   simply read as not-yet-matched, and they weren't playing anyway. */
+function emptyIndex(){ return {byFull:{}, bySur:{}, all:[], teams:{}, at:Date.now()}; }
+
+function addTeamToIndex(idx, team, j){
+  var n=0;
+  ['forwards','defensemen','goalies'].forEach(function(k){
+    (j[k]||[]).forEach(function(p){
+      var fn=(p.firstName&&p.firstName.default)||'', ln=(p.lastName&&p.lastName.default)||'';
+      if(!ln) return;
+      var rec={id:p.id, first:fn, last:ln, full:(fn+' '+ln).trim(), team:team, pos:p.positionCode};
+      idx.all.push(rec);
+      (idx.byFull[norm(rec.full)] = idx.byFull[norm(rec.full)]||[]).push(rec);
+      (idx.bySur[norm(ln)]        = idx.bySur[norm(ln)]||[]).push(rec);
+      n++;
+    });
   });
+  idx.teams[team]=1;
+  return n;
+}
+function reindex(all, at, teams){
+  var idx=emptyIndex(); idx.at=at||Date.now(); idx.teams=teams||{};
+  all.forEach(function(r){
+    idx.all.push(r);
+    (idx.byFull[norm(r.full)] = idx.byFull[norm(r.full)]||[]).push(r);
+    (idx.bySur[norm(r.last)]  = idx.bySur[norm(r.last)]||[]).push(r);
+  });
+  return idx;
 }
 function loadIndexFromCache(){
   var c = store.get('index',null);
   if(!c || !c.all || !c.all.length) return false;
-  if(Date.now()-c.at > 7*24*3600*1000) return false;  // refresh weekly; trades go stale
-  var byFull={}, bySur={};
-  c.all.forEach(function(r){
-    (byFull[norm(r.full)] = byFull[norm(r.full)]||[]).push(r);
-    (bySur[norm(r.last)]  = bySur[norm(r.last)]||[]).push(r);
-  });
-  S.index={byFull:byFull, bySur:bySur, all:c.all, at:c.at};
+  if(Date.now()-c.at > 7*24*3600*1000) return false;   // weekly rebuild; trades go stale
+  S.index = reindex(c.all, c.at, c.teams||{});
   return true;
+}
+function saveIndex(){
+  try{ store.set('index',{at:S.index.at, all:S.index.all, teams:S.index.teams}); }catch(e){}
+}
+function indexTeamCount(){ return S.index ? Object.keys(S.index.teams).length : 0; }
+
+/* Teams still missing from the index, least-recently-needed first. */
+function topUpTeams(n){
+  if(!S.index) return TEAMS.slice(0,n);
+  var missing = TEAMS.filter(function(t){ return !S.index.teams[t]; });
+  return missing.slice(0,n);
+}
+function ensureIndex(wanted){
+  if(!S.index) S.index = emptyIndex();
+  var todo=[], seen={};
+  (wanted||[]).forEach(function(t){
+    t=teamCode(t);
+    if(t && TEAMS.indexOf(t)>-1 && !S.index.teams[t] && !seen[t]){ seen[t]=1; todo.push(t); }
+  });
+  if(!todo.length) return Promise.resolve();
+  var ok=0, lastErr=null;
+  S.prog={done:0,total:todo.length};
+  render();
+  return throttle(todo, 2, function(t){           // gentle: two at a time
+    return getJSON(API+'/v1/roster/'+t+'/current')
+      .then(function(j){ addTeamToIndex(S.index, t, j); ok++; })
+      .catch(function(e){ lastErr=e; })
+      .then(function(){ S.prog.done++; render(); });
+  }).then(function(){
+    S.prog=null;
+    if(ok){ S.netfail=false; saveIndex(); return; }
+    // Nothing at all came back, and we have no earlier index to fall back on.
+    if(!S.index.all.length){
+      S.netfail=true;
+      throw new Error(lastErr ? String(lastErr.message||lastErr) : 'No rosters came back.');
+    }
+  });
 }
 
 /* Resolution, safest first. Never matches on a first initial. */
@@ -369,20 +414,26 @@ function resolveAll(){
 }
 
 // ---------- live data ----------
-function loadToday(){
+function loadGames(){
   return getJSON(API+'/v1/score/now').then(function(j){
-    var games=(j.games||[]);
-    S.games=games.map(function(g){
+    S.games=(j.games||[]).map(function(g){
       return {id:g.id, away:(g.awayTeam||{}).abbrev, home:(g.homeTeam||{}).abbrev,
               as:(g.awayTeam||{}).score, hs:(g.homeTeam||{}).score,
               state:g.gameState, start:g.startTimeUTC,
               per:(g.periodDescriptor||{}).number,
               clock:(g.clock||{}).timeRemaining, inter:(g.clock||{}).inIntermission};
     });
-    var played=games.filter(function(g){ return ['LIVE','CRIT','FINAL','OFF'].indexOf(g.gameState)>-1; });
-    return throttle(played, 4, function(g){
-      return getJSON(API+'/v1/gamecenter/'+g.id+'/boxscore').catch(function(){ return null; });
-    });
+  });
+}
+function teamsPlayingToday(){
+  var out=[];
+  S.games.forEach(function(g){ if(g.away) out.push(g.away); if(g.home) out.push(g.home); });
+  return out;
+}
+function loadBoxes(){
+  var played=S.games.filter(function(g){ return ['LIVE','CRIT','FINAL','OFF'].indexOf(g.state)>-1; });
+  return throttle(played, 3, function(g){
+    return getJSON(API+'/v1/gamecenter/'+g.id+'/boxscore').catch(function(){ return null; });
   }).then(function(boxes){
     var today={};
     (boxes||[]).forEach(function(b){
@@ -478,10 +529,12 @@ function parseTally(txt){
 function refresh(){
   if(S.busy) return Promise.resolve();
   S.busy=true; S.err=null; render();
-  var chain = Promise.resolve();
-  if(!S.index) chain = chain.then(function(){ if(!loadIndexFromCache()) return buildIndex(); });
-  return chain
-    .then(function(){ return Promise.all([loadToday(), loadSeason()]); })
+  if(!S.index) loadIndexFromCache();
+  // Games first: that tells us which rosters are actually worth fetching.
+  return loadGames()
+    .then(function(){ return ensureIndex(teamsPlayingToday().concat(topUpTeams(4))); })
+    .then(function(){ return loadBoxes(); })
+    .then(function(){ return loadSeason(); })
     .then(function(){ resolveAll(); S.busy=false; render(); })
     .catch(function(e){ S.err=e&&e.message||String(e); S.busy=false; render(); });
 }
@@ -637,8 +690,11 @@ function view_setup(){
      '<button class="btn btn-sm" id="copyworker" type="button" style="margin-top:9px">Copy this code</button></div>';
 
   h+='<div class="card"><h2>Player index</h2>'+
-     '<p class="sub">'+(S.index?('Holding '+S.index.all.length+' NHL players, built '+
-        new Date(S.index.at).toLocaleString()+'. Rebuild after trades.'):'Not built yet.')+'</p>'+
+     '<p class="sub">'+(S.index&&S.index.all.length
+        ? (S.index.all.length+' NHL players from '+indexTeamCount()+' of 32 teams, first built '+
+           new Date(S.index.at).toLocaleString()+'. The rest fill in as those teams play. '+
+           'Rebuild after a trade.')
+        : 'Not built yet — it fills in the first time you load it during a game day.')+'</p>'+
      '<button class="btn" id="rebuild" type="button">Rebuild index</button></div>';
   return h;
 }
@@ -705,9 +761,10 @@ function banners(){
   }
   if(S.prog){
     var pc=Math.round(100*S.prog.done/S.prog.total);
-    h+='<div class="banner"><h3>Building the player index</h3>'+
-       '<p>Reading all 32 NHL rosters so every pool player gets pinned to a real player ID. '+
-       'One-time, then it’s cached.</p><div class="bar"><i style="width:'+pc+'%"></i></div></div>';
+    h+='<div class="banner"><h3>Matching players to NHL rosters</h3>'+
+       '<p>Reading '+S.prog.total+' roster'+(S.prog.total===1?'':'s')+' so tonight’s skaters get '+
+       'pinned to real player IDs. Cached once it’s done.</p>'+
+       '<div class="bar"><i style="width:'+pc+'%"></i></div></div>';
   }
   return h;
 }
@@ -743,7 +800,7 @@ document.addEventListener('click',function(e){
   if(b&&b.id==='refresh'){ refresh().then(schedule); return; }
   if(b&&(b.id==='retry')){ refresh().then(schedule); return; }
   if(b&&(b.id==='gosetup'||b.id==='gosetup2')){ S.tab='setup'; render(); return; }
-  if(b&&b.id==='rebuild'){ store.del('index'); S.index=null; refresh().then(schedule); return; }
+  if(b&&b.id==='rebuild'){ store.del('index'); S.index=null; S.test=''; refresh().then(schedule); return; }
 
   if(b&&b.id==='loadtally'){
     var r=parseTally(document.getElementById('tally').value);
