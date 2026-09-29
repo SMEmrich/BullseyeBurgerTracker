@@ -152,6 +152,8 @@ pre.code{margin:9px 0 0;padding:11px 13px;background:var(--surface-2);border:1px
   border-radius:8px;font-family:var(--fm);font-size:11px;line-height:1.6;overflow-x:auto;white-space:pre}
 .hint{font-size:11.5px;color:var(--muted);margin:7px 0 0;max-width:64ch}
 .empty{color:var(--muted);font-size:13px;padding:14px 0;text-align:center}
+.whogrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(92px,1fr));gap:8px;margin-top:4px}
+.whogrid .btn{width:100%}
 .bar{height:5px;border-radius:99px;background:var(--line-soft);overflow:hidden;margin-top:9px}
 .bar>i{display:block;height:100%;background:var(--accent);border-radius:99px;transition:width .25s ease}
 .srch{position:relative}
@@ -215,7 +217,7 @@ var DEFAULT_ROSTER = {"Tony":[{"name":"Connor McDavid","team":"EDM","pos":"C"},{
 var API   = 'https://api-web.nhle.com';
 var STATS = 'https://api.nhle.com';
 
-var BUILD = 'v6 · 29 Sep';
+var BUILD = 'v7 · 29 Sep';
 var IDX_VER = 6;   // bump whenever the cached index shape changes, to discard old caches
 // Baked in so every device and every GM works on first open. Settings live in
 // localStorage, which is per-browser — without a default here, each phone would
@@ -242,7 +244,7 @@ var S = {
   overrides: store.get('overrides',{}),  // "norm name" -> playerId
   index:null, indexAt:0,
   resolved:{}, unresolved:[],
-  today:{}, games:[], season:{},
+  today:{}, games:[], season:{}, seasonAt:0, boxes:{},
   err:null, netfail:false, test:'', busy:false, lastAt:0, prog:null,
   pick:{open:false,for:null,q:''}, addq:''
 };
@@ -445,13 +447,27 @@ function teamsPlayingToday(){
   S.games.forEach(function(g){ if(g.away) out.push(g.away); if(g.home) out.push(g.home); });
   return out;
 }
+var FINAL_TTL = 5*60*1000;   // finished games only need re-reading for stat corrections
+
 function loadBoxes(){
   var played=S.games.filter(function(g){ return ['LIVE','CRIT','FINAL','OFF'].indexOf(g.state)>-1; });
-  return throttle(played, 3, function(g){
-    return getJSON(API+'/v1/gamecenter/'+g.id+'/boxscore').catch(function(){ return null; });
-  }).then(function(boxes){
+  var now=Date.now();
+  // Re-read a live game every cycle; a finished one at most every five minutes.
+  // With eleven GMs sharing one proxy, refetching finals every 30s is most of the traffic.
+  var need=played.filter(function(g){
+    var c=S.boxes[g.id];
+    if(!c || !c.box) return true;
+    if(g.state==='LIVE' || g.state==='CRIT') return true;
+    return (now - c.at) > FINAL_TTL;
+  });
+  return throttle(need, 3, function(g){
+    return getJSON(API+'/v1/gamecenter/'+g.id+'/boxscore')
+      .then(function(j){ S.boxes[g.id]={at:Date.now(), box:j}; })
+      .catch(function(){});
+  }).then(function(){
     var today={};
-    (boxes||[]).forEach(function(b){
+    played.forEach(function(g){
+      var c=S.boxes[g.id]; var b=c&&c.box;
       if(!b||!b.playerByGameStats) return;
       ['awayTeam','homeTeam'].forEach(function(side){
         var team = (b[side==='awayTeam'?'awayTeam':'homeTeam']||{}).abbrev;
@@ -467,8 +483,11 @@ function loadBoxes(){
     S.lastAt=Date.now();
   });
 }
+var SEASON_TTL = 5*60*1000;
 function loadSeason(){
-  // Regular-season totals in one call. Empty until the season opens.
+  // Regular-season totals in one call — a big payload, and it barely moves
+  // between polls, so it is fetched at most every five minutes.
+  if(S.seasonAt && (Date.now()-S.seasonAt) < SEASON_TTL) return Promise.resolve();
   var season = seasonId();
   var u = STATS+'/stats/rest/en/skater/summary?limit=2500&start=0&sort=points&cayenneExp='+
           encodeURIComponent('seasonId='+season+' and gameTypeId=2');
@@ -477,8 +496,8 @@ function loadSeason(){
     (j.data||[]).forEach(function(r){
       if(r.playerId!=null) m[r.playerId]={p:r.points||0, g:r.goals||0, a:r.assists||0, gp:r.gamesPlayed||0};
     });
-    S.season=m;
-  }).catch(function(){ S.season={}; });
+    S.season=m; S.seasonAt=Date.now();
+  }).catch(function(){ if(!S.seasonAt) S.season={}; });
 }
 function seasonId(){
   var d=new Date(), y=d.getFullYear();
@@ -562,10 +581,21 @@ function schedule(){
 }
 
 // ============================ VIEWS ============================
+function whoCard(gms){
+  return '<div class="card"><h2>Which team is yours?</h2>'+
+    '<p class="sub">Tap once and this device remembers. It decides whose roster shows up here '+
+    'and highlights your row in the pool standings.</p>'+
+    '<div class="whogrid">'+gms.map(function(g){
+      return '<button class="btn" data-me="'+esc(g)+'" type="button">'+esc(g)+'</button>';
+    }).join('')+'</div></div>';
+}
+
 function view_mine(){
   if(!S.roster){ return setupPrompt(); }
   var gms=Object.keys(S.roster);
-  var me=S.me && S.roster[S.me] ? S.me : gms[0];
+  // Never quietly show someone else's team — ask instead.
+  if(!(S.me && S.roster[S.me])) return whoCard(gms);
+  var me=S.me;
   var list=S.roster[me]||[];
   var tot=gmTotals(me);
   var rows=list.map(function(p){
@@ -864,6 +894,7 @@ document.addEventListener('click',function(e){
     refresh().then(schedule); return;
   }
   if(b&&b.dataset&&b.dataset.fix!=null){ S.pick={open:true,for:b.dataset.fix,q:b.dataset.fix}; render(); return; }
+  if(b&&b.dataset&&b.dataset.me!=null){ S.me=b.dataset.me; store.set('me',S.me); render(); return; }
   if(b&&b.id==='pickcancel'){ S.pick={open:false,for:null,q:''}; render(); return; }
   if(b&&b.dataset&&b.dataset.rm!=null){
     var w=S.roster['My watchlist']||[];
@@ -901,6 +932,16 @@ document.addEventListener('change',function(e){
 document.addEventListener('visibilitychange',function(){
   if(!document.hidden && Date.now()-S.lastAt>30000) refresh().then(schedule);
 });
+
+// A link like ...index.html?gm=George opens straight to that GM's team.
+try{
+  var qgm=(location.search.match(/[?&]gm=([^&]*)/)||[])[1];
+  if(qgm && S.roster){
+    var want=norm(decodeURIComponent(qgm.replace(/\+/g,' ')));
+    var found=Object.keys(S.roster).filter(function(g){ return norm(g)===want; })[0];
+    if(found){ S.me=found; store.set('me',found); }
+  }
+}catch(e){}
 
 render();
 refresh().then(schedule);
