@@ -215,7 +215,8 @@ var DEFAULT_ROSTER = {"Tony":[{"name":"Connor McDavid","team":"EDM","pos":"C"},{
 var API   = 'https://api-web.nhle.com';
 var STATS = 'https://api.nhle.com';
 
-var BUILD = 'v5 · 29 Sep';
+var BUILD = 'v6 · 29 Sep';
+var IDX_VER = 6;   // bump whenever the cached index shape changes, to discard old caches
 // Baked in so every device and every GM works on first open. Settings live in
 // localStorage, which is per-browser — without a default here, each phone would
 // arrive with an empty proxy field and fail. Clear the field in Setup to go direct.
@@ -304,19 +305,27 @@ function throttle(items, n, fn){
    today are fetched up front, plus a few spares each refresh, so the index fills
    in over a couple of nights. A team we don't have yet costs nothing: its players
    simply read as not-yet-matched, and they weren't playing anyway. */
-function emptyIndex(){ return {byFull:{}, bySur:{}, all:[], teams:{}, at:Date.now()}; }
+function emptyIndex(){ return {byFull:{}, bySur:{}, all:[], teams:{}, ids:{}, at:Date.now()}; }
 
+/* One entry per playerId, always. A player appearing twice makes every match
+   involving him ambiguous, and an ambiguous match is refused by design — so a
+   duplicate doesn't cause a wrong answer, it causes NO answer. */
+function pushRec(idx, rec){
+  if(idx.ids[rec.id]) return false;
+  idx.ids[rec.id]=1;
+  idx.all.push(rec);
+  (idx.byFull[norm(rec.full)] = idx.byFull[norm(rec.full)]||[]).push(rec);
+  (idx.bySur[norm(rec.last)]  = idx.bySur[norm(rec.last)]||[]).push(rec);
+  return true;
+}
 function addTeamToIndex(idx, team, j){
   var n=0;
   ['forwards','defensemen','goalies'].forEach(function(k){
     (j[k]||[]).forEach(function(p){
       var fn=(p.firstName&&p.firstName.default)||'', ln=(p.lastName&&p.lastName.default)||'';
-      if(!ln) return;
-      var rec={id:p.id, first:fn, last:ln, full:(fn+' '+ln).trim(), team:team, pos:p.positionCode};
-      idx.all.push(rec);
-      (idx.byFull[norm(rec.full)] = idx.byFull[norm(rec.full)]||[]).push(rec);
-      (idx.bySur[norm(ln)]        = idx.bySur[norm(ln)]||[]).push(rec);
-      n++;
+      if(!ln || p.id==null) return;
+      if(pushRec(idx, {id:p.id, first:fn, last:ln, full:(fn+' '+ln).trim(),
+                       team:team, pos:p.positionCode})) n++;
     });
   });
   idx.teams[team]=1;
@@ -324,22 +333,21 @@ function addTeamToIndex(idx, team, j){
 }
 function reindex(all, at, teams){
   var idx=emptyIndex(); idx.at=at||Date.now(); idx.teams=teams||{};
-  all.forEach(function(r){
-    idx.all.push(r);
-    (idx.byFull[norm(r.full)] = idx.byFull[norm(r.full)]||[]).push(r);
-    (idx.bySur[norm(r.last)]  = idx.bySur[norm(r.last)]||[]).push(r);
-  });
+  all.forEach(function(r){ if(r && r.id!=null) pushRec(idx, r); });
   return idx;
 }
 function loadIndexFromCache(){
   var c = store.get('index',null);
   if(!c || !c.all || !c.all.length) return false;
+  // A cache written by an older build has a different shape; merging into it is
+  // what produced the duplicates. Throw it away rather than try to repair it.
+  if(c.v !== IDX_VER){ store.del('index'); return false; }
   if(Date.now()-c.at > 7*24*3600*1000) return false;   // weekly rebuild; trades go stale
   S.index = reindex(c.all, c.at, c.teams||{});
   return true;
 }
 function saveIndex(){
-  try{ store.set('index',{at:S.index.at, all:S.index.all, teams:S.index.teams}); }catch(e){}
+  try{ store.set('index',{v:IDX_VER, at:S.index.at, all:S.index.all, teams:S.index.teams}); }catch(e){}
 }
 function indexTeamCount(){ return S.index ? Object.keys(S.index.teams).length : 0; }
 
@@ -376,6 +384,13 @@ function ensureIndex(wanted){
   });
 }
 
+/* Two records for the same player are the same player, not a genuine ambiguity. */
+function uniq(list){
+  var seen={}, out=[];
+  (list||[]).forEach(function(r){ if(r && !seen[r.id]){ seen[r.id]=1; out.push(r); } });
+  return out;
+}
+
 /* Resolution, safest first. Never matches on a first initial. */
 function resolveOne(p){
   var idx=S.index; if(!idx) return null;
@@ -383,7 +398,7 @@ function resolveOne(p){
   var ov=S.overrides[key];
   if(ov){ var hit=idx.all.filter(function(r){ return r.id===ov; })[0]; if(hit) return {rec:hit,how:'manual'}; }
 
-  var ex = idx.byFull[key]||[];
+  var ex = uniq(idx.byFull[key]);
   if(ex.length===1) return {rec:ex[0],how:'exact'};
   if(ex.length>1){
     var t=teamCode(p.team), m=ex.filter(function(r){ return r.team===t; });
@@ -391,7 +406,7 @@ function resolveOne(p){
   }
   // Nickname case (Mitch vs Mitchell): same surname, same team, one first name
   // a prefix of the other. Flagged for confirmation, never silent.
-  var sur=idx.bySur[norm(surnameOf(p.name))]||[];
+  var sur=uniq(idx.bySur[norm(surnameOf(p.name))]);
   var tc=teamCode(p.team);
   var same=sur.filter(function(r){
     if(r.team!==tc) return false;
