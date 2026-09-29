@@ -231,7 +231,7 @@ var S = {
   index:null, indexAt:0,
   resolved:{}, unresolved:[],
   today:{}, games:[], season:{},
-  err:null, busy:false, lastAt:0, prog:null,
+  err:null, netfail:false, test:'', busy:false, lastAt:0, prog:null,
   pick:{open:false,for:null,q:''}, addq:''
 };
 
@@ -278,11 +278,11 @@ function throttle(items, n, fn){
 
 // ---------- name -> playerId index ----------
 function buildIndex(){
-  var byFull={}, bySur={}, all=[];
+  var byFull={}, bySur={}, all=[], lastErr=null;
   S.prog={done:0,total:TEAMS.length};
   render();
   return throttle(TEAMS, 6, function(t){
-    return getJSON(API+'/v1/roster/'+t+'/current').then(function(j){
+    return getJSON(API+'/v1/roster/'+t+'/current').catch(function(e){ lastErr=e; throw e; }).then(function(j){
       ['forwards','defensemen','goalies'].forEach(function(k){
         (j[k]||[]).forEach(function(p){
           var fn=(p.firstName&&p.firstName.default)||'', ln=(p.lastName&&p.lastName.default)||'';
@@ -296,7 +296,11 @@ function buildIndex(){
     }).then(function(){ S.prog.done++; render(); });
   }).then(function(){
     S.prog=null;
-    if(!all.length) throw new Error('No rosters came back.');
+    if(!all.length){
+      S.netfail = true;
+      throw new Error(lastErr ? String(lastErr.message||lastErr) : 'No rosters came back.');
+    }
+    S.netfail = false;
     var idx={byFull:byFull, bySur:bySur, all:all, at:Date.now()};
     S.index=idx;
     try{ store.set('index',{at:idx.at, all:all}); }catch(e){}
@@ -605,10 +609,13 @@ function view_setup(){
      'everything routes through there instead.</p>'+
      '<div class="field"><label class="fl" for="proxy">Proxy address (optional)</label>'+
      '<input type="url" id="proxy" value="'+esc(S.proxy)+'" placeholder="https://something.workers.dev/"></div>'+
-     '<button class="btn" id="saveproxy" type="button">Save and retry</button>'+
-     '<p class="hint">Leave it empty to call the NHL directly. If the app can’t reach the API, '+
-     'deploy this as a Cloudflare Worker and paste its address above:</p>'+
-     '<pre class="code">'+esc(WORKER_SRC)+'</pre></div>';
+     '<button class="btn btn-primary" id="saveproxy" type="button">Save and retry</button> '+
+     '<button class="btn" id="testconn" type="button">Test connection</button>'+
+     '<p class="hint" id="testmsg">'+(S.test?esc(S.test):'Leave the field empty to call the NHL directly.')+'</p>'+
+     '<p class="hint">Paste this into a Cloudflare Worker, deploy it, and put its address in the field above. '+
+     'It only forwards NHL requests — nothing else gets through it.</p>'+
+     '<pre class="code">'+esc(WORKER_SRC)+'</pre>'+
+     '<button class="btn btn-sm" id="copyworker" type="button" style="margin-top:9px">Copy this code</button></div>';
 
   h+='<div class="card"><h2>Player index</h2>'+
      '<p class="sub">'+(S.index?('Holding '+S.index.all.length+' NHL players, built '+
@@ -656,13 +663,17 @@ var WORKER_SRC =
 function banners(){
   var h='';
   if(S.err){
-    var cors = /Failed to fetch|NetworkError|load failed/i.test(S.err);
-    h+='<div class="banner bad"><h3>'+(cors?'Can’t reach the NHL':'Something went wrong')+'</h3>'+
-       '<p>'+(cors
-         ? 'The request didn’t get through. Either you’re offline, or your browser is refusing the call because the NHL doesn’t allow it from this address. The fix for the second one is the proxy in Setup.'
+    var blocked = S.netfail || /Failed to fetch|NetworkError|load failed|CORS/i.test(S.err);
+    h+='<div class="banner bad"><h3>'+(blocked?'Your browser is blocking the NHL':'Something went wrong')+'</h3>'+
+       '<p>'+(blocked
+         ? 'Every call was refused before it returned anything. That is almost always the browser’s '+
+           'cross-origin rule: the NHL’s servers don’t say this address is allowed to read their '+
+           'responses, so the browser throws the answer away. It is not something the page can fix from '+
+           'here — the calls have to come from a server instead. Setup has the proxy field and the code for one.'
          : esc(S.err))+'</p>'+
+       '<p class="hint mono" style="margin-top:6px">'+esc(S.err)+(S.proxy?' · via proxy '+esc(S.proxy):' · calling the NHL directly')+'</p>'+
        '<div class="row"><button class="btn btn-sm btn-primary" id="retry" type="button">Try again</button>'+
-       '<button class="btn btn-sm" id="gosetup2" type="button">Open setup</button></div></div>';
+       '<button class="btn btn-sm" id="gosetup2" type="button">Set up a proxy</button></div></div>';
   }
   if(S.prog){
     var pc=Math.round(100*S.prog.done/S.prog.total);
@@ -714,6 +725,32 @@ document.addEventListener('click',function(e){
     return;
   }
   if(b&&b.id==='clearroster'){ S.roster=null; store.del('roster'); resolveAll(); render(); return; }
+  if(b&&b.id==='testconn'){
+    S.test='Testing…'; render();
+    var t0=Date.now();
+    getJSON(API+'/v1/roster/TOR/current').then(function(j){
+      var n=(j.forwards||[]).length+(j.defensemen||[]).length+(j.goalies||[]).length;
+      S.test='Worked — '+n+' Leafs came back in '+(Date.now()-t0)+' ms. '+
+             (S.proxy?'Your proxy is doing its job.':'Direct calls are fine; no proxy needed.');
+      render();
+    }).catch(function(e){
+      S.test='Failed: '+(e&&e.message||e)+'. '+(S.proxy
+        ? 'Check the address is exactly what Cloudflare shows, ending in .workers.dev'
+        : 'This is the cross-origin block. A proxy will fix it.');
+      render();
+    });
+    return;
+  }
+  if(b&&b.id==='copyworker'){
+    var ta=document.createElement('textarea'); ta.value=WORKER_SRC;
+    ta.style.position='fixed'; ta.style.opacity='0';
+    document.body.appendChild(ta); ta.select();
+    var ok=false; try{ ok=document.execCommand('copy'); }catch(x){}
+    document.body.removeChild(ta);
+    b.textContent = ok ? 'Copied' : 'Select it manually';
+    setTimeout(function(){ b.textContent='Copy this code'; }, 2200);
+    return;
+  }
   if(b&&b.id==='saveproxy'){
     S.proxy=(document.getElementById('proxy').value||'').trim();
     store.set('proxy',S.proxy);
